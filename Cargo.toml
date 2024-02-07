@@ -22,7 +22,10 @@ default-members = [
 ]
 
 [profile.release]
-lto = "thin"
+lto = "fat"
+opt-level = 3
+strip = true
+# debug = true
 
 [profile.opt]
 inherits = "release"
@@ -65,4 +68,3 @@ categories = ["editor"]
 repository = "https://github.com/helix-editor/helix"
 homepage = "https://helix-editor.com"
 license = "MPL-2.0"
-rust-version = "1.87"

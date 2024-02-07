@@ -7,7 +7,6 @@ version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 categories.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -62,6 +61,9 @@ futures-util = { version = "0.3", features = ["std", "async-await"], default-fea
 arc-swap = { version = "1.8.0" }
 termini = "1"
 indexmap = "2.13"
+
+# alloc
+tikv-jemallocator = "0.5"
 
 # Logging
 fern = "0.7"
