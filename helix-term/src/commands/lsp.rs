@@ -375,9 +375,180 @@ pub fn symbol_picker(cx: &mut Context) {
         }
         let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
             let columns = [
+                // Some symbols in the document symbol picker may have a URI that isn't
+                // the current file. It should be rare though, so we concatenate that
+                // URI in with the symbol name in this picker.
+                ui::PickerColumn::new("name", |item: &SymbolInformationItem, _| {
+                    item.symbol.name.as_str().into()
+                }),
                 ui::PickerColumn::new("kind", |item: &SymbolInformationItem, _| {
                     display_symbol_kind(item.symbol.kind).into()
                 }),
+            ];
+
+            let picker = Picker::new(
+                columns,
+                0, // name column
+                symbols,
+                (),
+                move |cx, item, action| {
+                    jump_to_location(
+                        cx.editor,
+                        &item.symbol.location,
+                        item.offset_encoding,
+                        action,
+                    );
+                },
+            )
+            .with_preview(move |_editor, item| {
+                uri_to_file_location(&item.uri, &item.symbol.location.range)
+            })
+            .truncate_start(false);
+
+            compositor.push(Box::new(overlaid(picker)))
+        };
+
+        Ok(Callback::EditorCompositor(Box::new(call)))
+    });
+}
+
+pub fn symbol_method_picker(cx: &mut Context) {
+    fn nested_to_flat(
+        list: &mut Vec<SymbolInformationItem>,
+        file: &lsp::TextDocumentIdentifier,
+        uri: &Uri,
+        symbol: lsp::DocumentSymbol,
+        offset_encoding: OffsetEncoding,
+        layer: usize,
+    ) {
+        let prefix = if layer == 0 {
+            String::new()
+        } else {
+            format!("{:>wid$}", "-", wid = layer * 2 + 1)
+        };
+
+        let (w, _) = crossterm::terminal::size().unwrap();
+        let factor: f32 = match w {
+            0..=80 => 0.38,
+            81..=110 => 0.4,
+            _ => 0.42,
+        };
+        let w = (w as f32 * factor).floor() as usize;
+        let suffix_len = w.saturating_sub(prefix.len() + symbol.name.len());
+        let suffix = if suffix_len == 0 {
+            String::new()
+        } else {
+            format!("{:>wid$}", sbl_kind(symbol.kind), wid = suffix_len)
+        };
+
+        let node_name = format!("{prefix}{}{suffix}", symbol.name);
+
+        fn sbl_kind(sbl: lsp::SymbolKind) -> &'static str {
+            macro_rules! pair {
+                ( $($k:ident => $s:expr),+ ) => {
+                    match sbl { $(
+                      lsp::SymbolKind::$k => concat!('[', $s, ']'),
+                    )+
+                    _ => "[??]" }
+                }
+            }
+            pair! {
+                FILE=>"file",
+                MODULE=>"mod", NAMESPACE=>"ns", PACKAGE=>"pkg",
+                CLASS=>"class", METHOD=>"method", PROPERTY=>"prop", FIELD=>"field",
+                CONSTRUCTOR=>"ctor", ENUM=>"enum", INTERFACE=>"iface", FUNCTION=>"func",
+                VARIABLE=>"var", CONSTANT=>"const", STRING=>"str", NUMBER=>"num", BOOLEAN=>"bool",
+                ARRAY=>"array", OBJECT=>"object", KEY=>"key", NULL=>"null",
+                ENUM_MEMBER=>"enum_var", STRUCT=>"struct", EVENT=>"event", OPERATOR=>"op",
+                TYPE_PARAMETER=>"type_param"
+            }
+        }
+
+        #[allow(deprecated)]
+        list.push(SymbolInformationItem {
+            symbol: lsp::SymbolInformation {
+                name: node_name,
+                kind: symbol.kind,
+                tags: symbol.tags,
+                deprecated: symbol.deprecated,
+                location: lsp::Location::new(file.uri.clone(), symbol.selection_range),
+                container_name: None,
+            },
+            offset_encoding,
+            uri: uri.clone(),
+        });
+
+        for child in symbol.children.into_iter().flatten() {
+            nested_to_flat(list, file, uri, child, offset_encoding, layer + 1);
+        }
+    }
+    let doc = doc!(cx.editor);
+
+    let mut seen_language_servers = HashSet::new();
+
+    let mut futures: FuturesOrdered<_> = doc
+        .language_servers_with_feature(LanguageServerFeature::DocumentSymbols)
+        .filter(|ls| seen_language_servers.insert(ls.id()))
+        .map(|language_server| {
+            let request = language_server.document_symbols(doc.identifier()).unwrap();
+            let offset_encoding = language_server.offset_encoding();
+            let doc_id = doc.identifier();
+            let doc_uri = doc
+                .uri()
+                .expect("docs with active language servers must be backed by paths");
+
+            async move {
+                let json = request.await?;
+                let response: Option<lsp::DocumentSymbolResponse> = serde_json::from_value(json)?;
+                let symbols = match response {
+                    Some(symbols) => symbols,
+                    None => return anyhow::Ok(vec![]),
+                };
+                // lsp has two ways to represent symbols (flat/nested)
+                // convert the nested variant to flat, so that we have a homogeneous list
+                let symbols = match symbols {
+                    lsp::DocumentSymbolResponse::Flat(symbols) => symbols
+                        .into_iter()
+                        .map(|symbol| SymbolInformationItem {
+                            uri: doc_uri.clone(),
+                            symbol,
+                            offset_encoding,
+                        })
+                        .collect(),
+                    lsp::DocumentSymbolResponse::Nested(symbols) => {
+                        let mut flat_symbols = Vec::new();
+                        for symbol in symbols {
+                            nested_to_flat(
+                                &mut flat_symbols,
+                                &doc_id,
+                                &doc_uri,
+                                symbol,
+                                offset_encoding,
+                                0,
+                            )
+                        }
+                        flat_symbols
+                    }
+                };
+                Ok(symbols)
+            }
+        })
+        .collect();
+
+    if futures.is_empty() {
+        cx.editor
+            .set_error("No configured language server supports document symbols");
+        return;
+    }
+
+    cx.jobs.callback(async move {
+        let mut symbols = Vec::new();
+        // TODO if one symbol request errors, all other requests are discarded (even if they're valid)
+        while let Some(mut lsp_items) = futures.try_next().await? {
+            symbols.append(&mut lsp_items);
+        }
+        let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
+            let columns = [
                 // Some symbols in the document symbol picker may have a URI that isn't
                 // the current file. It should be rare though, so we concatenate that
                 // URI in with the symbol name in this picker.
@@ -388,7 +559,7 @@ pub fn symbol_picker(cx: &mut Context) {
 
             let picker = Picker::new(
                 columns,
-                1, // name column
+                0, // name column
                 symbols,
                 (),
                 move |cx, item, action| {
