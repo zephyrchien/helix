@@ -400,6 +400,138 @@ pub fn symbol_picker(cx: &mut Context) {
     });
 }
 
+pub fn symbol_method_picker(cx: &mut Context) {
+    fn nested_to_flat(
+        list: &mut Vec<SymbolInformationItem>,
+        file: &lsp::TextDocumentIdentifier,
+        symbol: lsp::DocumentSymbol,
+        offset_encoding: OffsetEncoding,
+        layer: usize,
+    ) {
+        let prefix = if layer == 0 {
+            String::new()
+        } else {
+            format!("{:>wid$}", "-", wid = layer * 2 + 1)
+        };
+
+        let (w, _) = crossterm::terminal::size().unwrap();
+        let factor: f32 = match w {
+            0..=80 => 0.38,
+            81..=110 => 0.4,
+            _ => 0.42
+        };
+        let w = (w as f32 * factor).floor() as usize;
+        let suffix_len = w.saturating_sub(prefix.len() + symbol.name.len());
+        let suffix = if suffix_len == 0 {
+            String::new()
+        } else {
+            format!("{:>wid$}", sbl_kind(symbol.kind), wid = suffix_len)
+        };
+
+        let node_name = format!("{prefix}{}{suffix}", symbol.name);
+
+        fn sbl_kind(sbl: lsp::SymbolKind) -> &'static str {
+            macro_rules! pair {
+                ( $($k:ident => $s:expr),+ ) => {
+                    match sbl { $(
+                      lsp::SymbolKind::$k => concat!('[', $s, ']'),
+                    )+
+                    _ => "[??]" }
+                }
+            }
+            pair! {
+                FILE=>"file",
+                MODULE=>"mod", NAMESPACE=>"ns", PACKAGE=>"pkg",
+                CLASS=>"class", METHOD=>"method", PROPERTY=>"prop", FIELD=>"field",
+                CONSTRUCTOR=>"ctor", ENUM=>"enum", INTERFACE=>"iface", FUNCTION=>"func",
+                VARIABLE=>"var", CONSTANT=>"const", STRING=>"str", NUMBER=>"num", BOOLEAN=>"bool",
+                ARRAY=>"array", OBJECT=>"object", KEY=>"key", NULL=>"null",
+                ENUM_MEMBER=>"enum_var", STRUCT=>"struct", EVENT=>"event", OPERATOR=>"op",
+                TYPE_PARAMETER=>"type_param"
+            }
+        }
+
+        #[allow(deprecated)]
+        list.push(SymbolInformationItem {
+            symbol: lsp::SymbolInformation {
+                name: node_name,
+                kind: symbol.kind,
+                tags: symbol.tags,
+                deprecated: symbol.deprecated,
+                location: lsp::Location::new(file.uri.clone(), symbol.selection_range),
+                container_name: None,
+            },
+            offset_encoding,
+        });
+
+        for child in symbol.children.into_iter().flatten() {
+            nested_to_flat(list, file, child, offset_encoding, layer + 1);
+        }
+    }
+    let doc = doc!(cx.editor);
+
+    let mut seen_language_servers = HashSet::new();
+
+    let mut futures: FuturesOrdered<_> = doc
+        .language_servers_with_feature(LanguageServerFeature::DocumentSymbols)
+        .filter(|ls| seen_language_servers.insert(ls.id()))
+        .map(|language_server| {
+            let request = language_server.document_symbols(doc.identifier()).unwrap();
+            let offset_encoding = language_server.offset_encoding();
+            let doc_id = doc.identifier();
+
+            async move {
+                let json = request.await?;
+                let response: Option<lsp::DocumentSymbolResponse> = serde_json::from_value(json)?;
+                let symbols = match response {
+                    Some(symbols) => symbols,
+                    None => return anyhow::Ok(vec![]),
+                };
+                // lsp has two ways to represent symbols (flat/nested)
+                // convert the nested variant to flat, so that we have a homogeneous list
+                let symbols = match symbols {
+                    lsp::DocumentSymbolResponse::Flat(symbols) => symbols
+                        .into_iter()
+                        .map(|symbol| SymbolInformationItem {
+                            symbol,
+                            offset_encoding,
+                        })
+                        .collect(),
+                    lsp::DocumentSymbolResponse::Nested(symbols) => {
+                        let mut flat_symbols = Vec::new();
+                        for symbol in symbols {
+                            nested_to_flat(&mut flat_symbols, &doc_id, symbol, offset_encoding, 0)
+                        }
+                        flat_symbols
+                    }
+                };
+                Ok(symbols)
+            }
+        })
+        .collect();
+    let current_url = doc.url();
+
+    if futures.is_empty() {
+        cx.editor
+            .set_error("No configured language server supports document symbols");
+        return;
+    }
+
+    cx.jobs.callback(async move {
+        let mut symbols = Vec::new();
+        // TODO if one symbol request errors, all other requests are discarded (even if they're valid)
+        while let Some(mut lsp_items) = futures.try_next().await? {
+            symbols.append(&mut lsp_items);
+        }
+        let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
+            let picker = sym_picker(symbols, current_url);
+            compositor.push(Box::new(overlaid(picker)))
+        };
+
+        Ok(Callback::EditorCompositor(Box::new(call)))
+    });
+}
+
 pub fn workspace_symbol_picker(cx: &mut Context) {
     let doc = doc!(cx.editor);
     if doc
