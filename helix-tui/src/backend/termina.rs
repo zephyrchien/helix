@@ -224,9 +224,6 @@ impl TerminaBackend {
                 // <https://github.com/wezterm/wezterm/pull/6856>
                 || matches!(term_program().as_deref(), Some("WezTerm"));
 
-            if let Some(termini::Value::Utf8String(se_str)) = t.extended_cap("Se") {
-                reset_cursor_command.push_str(se_str);
-            };
             reset_cursor_command.push_str(
                 t.utf8_string_cap(termini::StringCapability::CursorNormal)
                     .unwrap_or(""),
